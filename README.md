@@ -132,8 +132,7 @@ cells is slightly above the table value.
   higher than in the tables: MAGNET by up to 0.33 m ADE / 0.52 m FDE, Transformer-only by up to 0.39 m ADE /
   1.20 m FDE (intersection).
 - **Table 1 recomputed** the same way: the presented method 2.214 / 4.682 (table: 2.09 / 4.47), Transformer-only
-  2.412 / 5.063 (2.23 / 4.52), LSTM 2.208 / 6.435 (2.21 / 6.50), IDM 9.258 / 18.349 (9.13 / 18.04). No record of
-  the VectorNet run was found (section 5).
+  2.412 / 5.063 (2.23 / 4.52), LSTM 2.208 / 6.435 (2.21 / 6.50), IDM 9.258 / 18.349 (9.13 / 18.04). 
 
 ## 5. Where every number in the chapter comes from
 
