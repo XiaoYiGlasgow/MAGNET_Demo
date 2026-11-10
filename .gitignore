@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+runs/
+figures/demo/
+validate_debug.log

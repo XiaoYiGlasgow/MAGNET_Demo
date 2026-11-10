@@ -1,0 +1,395 @@
+\section{Deep Learning-Based Interactive Motion Planning}
+\label{sec:xiao_magnet_motion_planning}
+
+The preceding section considered a structured lane-change problem in which a specific target vehicle is selected and trajectory feasibility is evaluated through geometric constraints, target-vehicle prediction, and collision checking. Building on that formulation, this section addresses a broader interaction problem in urban traffic, where the ego vehicle must reason about multiple surrounding agents and map elements whose relevance varies across driving scenarios.
+% The implementation is available at: \url{https://github.com/XiaoYiGlasgow/MAGNET}.
+
+\subsection{Problem Description}
+\label{subsec:magnet_problem}
+
+In this broader setting, motion planning must determine not only a feasible future trajectory but also which surrounding entities and relationships should influence that trajectory. Unlike the preceding lane-change formulation, the relevant interacting agents and scene context are not always known in advance. Dense urban scenes may contain multiple vehicles, pedestrians, cyclists, crossings, lane structures, and traffic controls; consequently, an ego trajectory that is appropriate in one interaction context may be unsafe or inefficient in another.
+
+The planning problem therefore contains two coupled requirements. The model must represent the recent motion of the ego vehicle and surrounding agents, and it must identify which scene elements are relevant to the future manoeuvre. The first requirement is temporal, while the second depends on spatial and semantic relationships. Treating all inputs as one undifferentiated sequence can obscure this distinction.
+
+The learning-based motion planning task considered here is formulated as open-loop ego-trajectory prediction. Given a short history of the traffic scene, the model predicts the future ego trajectory over a fixed horizon. Let \(T_h\) denote the historical observation horizon and \(T_f\) denote the future planning horizon. The output trajectory is
+\begin{equation}
+    \hat{\mathbf{Y}} =
+    \{(\hat{x}_t,\hat{y}_t)\}_{t=1}^{T_f},
+    \qquad
+    \hat{\mathbf{Y}}\in\mathbb{R}^{T_f\times 2},
+    \label{eq:chapter_traj_output}
+\end{equation}
+where \((\hat{x}_t,\hat{y}_t)\) is the predicted ego position at future time step \(t\). The corresponding ground-truth future ego trajectory is denoted by \(\mathbf{Y}\).
+
+Numerical accuracy alone is insufficient: the output must reflect the interaction structure of the scene. An intersection may require broad map and traffic context, whereas high-speed lane following may depend mainly on nearby vehicles and local geometry. This section introduces a method that evaluates configurable graph topologies within one planning architecture.
+
+This formulation does not assume that one connectivity rule is optimal for every scene. Instead, it keeps the network modules and training objective fixed while changing the graph adjacency rule. The resulting comparison isolates the effect of topology from other architectural choices.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/scene_elements.pdf}
+    \caption{Overview of traffic scene elements relevant to motion planning. Map features include lane boundaries, pedestrian crossings, and traffic signals, while dynamic participants include vehicles, pedestrians, and cyclists. The heterogeneity of these elements motivates the modular, type-aware graph representation.
+    \label{fig:chapter_scene_elements}}
+\end{figure}
+
+\subsection{Related Work}
+\label{subsec:magnet_related_work}
+
+Classical models such as the Intelligent Driver Model (IDM) are interpretable and efficient but describe interactions through simplified rules. Learning-based methods instead encode traffic context from data. VectorNet represents maps and agent trajectories as polylines, while GNN-based models propagate relations among vehicles, lanes, and other scene elements.
+
+Transformer models capture temporal and multi-agent dependencies through attention; multimodal extensions also represent uncertainty in future motion. Many existing architectures nevertheless fuse spatial and temporal information early or assume a fixed interaction graph. The presented method separates temporal context, spatial interaction, and ego motion into distinct branches and evaluates multiple connectivity rules under the same architecture.
+
+\subsection{Graph Neural Network and Transformer Preliminaries}
+\label{subsec:gnn_transformer_background}
+
+\subsubsection{Graph Neural Networks}
+
+A graph provides a natural description of a traffic scene because it answers two simple questions: \textit{what is present}, and \textit{which elements may interact}? Formally, a graph is written as \(\mathcal{G}=(\mathcal{V},\mathcal{E})\), where \(\mathcal{V}\) is the node set and \(\mathcal{E}\) is the edge set. A node may represent the ego vehicle, another road user, or a lane segment. Its feature vector \(\mathbf{x}_i\) stores the information available for that element, such as position, heading, speed, or geometry. An edge \((j,i)\) states that information may flow from node \(j\) to node \(i\). The edge does not by itself prove that one element causes another to move; instead, it specifies a candidate interaction for the model to evaluate.
+
+Consider an ego vehicle approaching an intersection. One node describes the ego state, other nodes describe nearby vehicles and pedestrians, and additional nodes describe lanes and crossings. Edges can connect the ego vehicle to a nearby pedestrian, to the lane that it occupies, and to vehicles whose motion may affect the manoeuvre. A different scene can contain a different number of nodes and edges while using the same feature definitions. This flexibility makes graphs more suitable than a fixed grid or a single ordered list for representing heterogeneous traffic scenes.
+
+A Graph Neural Network (GNN) learns from this structure through \textit{message passing}. One layer performs three intuitive steps. First, each node gathers representations from its neighbours. Second, it aggregates the gathered messages using an order-independent operation, such as a sum or mean. Third, it combines the aggregate with its current representation to produce an updated node embedding. The order-independent aggregation is important because changing the database indices of two vehicles should not change the prediction.
+
+Let \(\mathbf{h}^{(\ell)}_i\) denote the representation of node \(i\) at layer \(\ell\), with \(\mathbf{h}^{(0)}_i=\mathbf{x}_i\). The message collected by node \(i\) can be written as
+\begin{equation}
+    \mathbf{m}^{(\ell)}_i =
+    \underset{j\in\mathcal{N}(i)}{\operatorname{AGGREGATE}}
+    \phi^{(\ell)}\!\left(
+    \mathbf{h}^{(\ell)}_i,
+    \mathbf{h}^{(\ell)}_j,
+    \mathbf{e}_{ji}
+    \right),
+    \label{eq:chapter_gnn_message}
+\end{equation}
+where \(\mathcal{N}(i)\) is the neighbour set, \(\mathbf{e}_{ji}\) is an optional edge feature, and \(\phi^{(\ell)}\) is a learnable message function. The node representation is then updated as
+\begin{equation}
+    \mathbf{h}^{(\ell+1)}_i =
+    \psi^{(\ell)}\!\left(
+    \mathbf{h}^{(\ell)}_i,
+    \mathbf{m}^{(\ell)}_i
+    \right),
+    \label{eq:chapter_gnn_update}
+\end{equation}
+where \(\psi^{(\ell)}\) combines the previous node state and the aggregated message. For the intersection example, the updated ego embedding can therefore contain its own motion state together with information received from connected road users and map elements.
+
+Each message-passing layer expands the information available to a node by one graph hop. After one layer, a node contains information from its immediate neighbours. After two layers, it can also receive information relayed through those neighbours. More layers provide a larger receptive field, but information can travel only along the edges in \(\mathcal{E}\). Adding or removing an edge therefore changes the interactions available to the GNN. This observation motivates the configurable topology study later in this section.
+
+GNNs can support node-level, edge-level, or graph-level outputs. The present task predicts one ego trajectory from the complete scene, so the model requires a fixed-dimensional scene representation. Graph-level pooling converts the variable number of final node embeddings into this representation. Mean pooling is given by
+\begin{equation}
+    \mathbf{h}_{\mathcal{G}}=
+    \frac{1}{|\mathcal{V}|}
+    \sum_{i\in\mathcal{V}}\mathbf{h}^{(L)}_i,
+    \label{eq:chapter_graph_pooling}
+\end{equation}
+where \(L\) is the final GNN layer. The result has the same dimension regardless of the number of agents and map elements in a scene. In this way, message passing first makes each node aware of its graph neighbourhood, and pooling then summarises the resulting set of node embeddings for trajectory prediction.
+
+\subsubsection{Transformers}
+
+A Transformer processes a set or sequence of input vectors, commonly called \textit{tokens}, using self-attention. Let \(\mathbf{X}\in\mathbb{R}^{M\times d}\) contain \(M\) token embeddings. Three learned projections form the query, key, and value matrices:
+\begin{equation}
+    \mathbf{Q}=\mathbf{X}\mathbf{W}_Q,\qquad
+    \mathbf{K}=\mathbf{X}\mathbf{W}_K,\qquad
+    \mathbf{V}=\mathbf{X}\mathbf{W}_V.
+    \label{eq:chapter_qkv_projection}
+\end{equation}
+For each token, its query is compared with every key. The scaled dot-product attention operation is
+\begin{equation}
+    \operatorname{Attention}(\mathbf{Q},\mathbf{K},\mathbf{V})
+    =
+    \operatorname{softmax}\!\left(
+    \frac{\mathbf{Q}\mathbf{K}^{\mathsf{T}}}{\sqrt{d_k}}
+    \right)\mathbf{V},
+    \label{eq:chapter_scaled_attention}
+\end{equation}
+where \(d_k\) is the key dimension. Each row of the softmax matrix contains the weights assigned by one token to all tokens. A large query--key similarity produces a large weight, so the output becomes a content-dependent weighted combination of the values. Division by \(\sqrt{d_k}\) prevents the dot products from growing excessively as the feature dimension increases.
+
+Multi-head attention performs this calculation in several learned subspaces:
+\begin{equation}
+    \operatorname{MultiHead}(\mathbf{X})
+    =
+    \operatorname{Concat}(\operatorname{head}_1,\ldots,
+    \operatorname{head}_R)\mathbf{W}_O,
+    \label{eq:chapter_multihead_attention}
+\end{equation}
+where each \(\operatorname{head}_r\) has its own query, key, and value projections. Different heads can therefore represent different dependencies, such as changes in ego motion, relations between nearby trajectory segments, or associations between agents and map context. The attention output is followed by a position-wise feed-forward network. Residual connections preserve the input to each sub-layer, and normalisation stabilises optimisation when several encoder layers are stacked.
+
+Self-attention by itself is insensitive to token order. A model must therefore provide order through positional encodings or input attributes that contain time. In the presented implementation, agent-segment features include time-related fields. The ego-history samples are supplied chronologically, but the current ego branch does not add an explicit positional encoding; its attention is consequently driven by the position values themselves. This distinction is important when interpreting what temporal order each branch can represent.
+
+Unlike a recurrent network, self-attention can connect any pair of tokens within one layer and can process the token projections in parallel. For trajectory generation, a token may describe a motion state or a polyline segment. The resulting contextual embedding summarises which observations are useful for predicting the future path. GNNs and Transformers nevertheless impose different assumptions: the GNN restricts information flow to explicitly defined edges, whereas the Transformer learns content-dependent relations across the supplied tokens. The presented method retains both branches so that structured spatial relations and temporal-contextual dependencies can be encoded separately before fusion.
+
+Fig.~\ref{fig:chapter_gnn_transformer_primer} summarises both operations visually. In the GNN, nodes store feature vectors for traffic entities, and directed edges specify which neighbours may send messages to a target node. The target aggregates these messages without depending on their order and combines the result with its current state. In the Transformer, learned projections convert token embeddings into queries, keys, and values. Scaled query--key similarities pass through a softmax to produce attention weights, which determine how the value vectors are combined into a contextualised token. Thus, graph edges prescribe candidate information-flow paths, whereas attention learns the relative strength of token-to-token dependencies from their features.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/gnn_transformer_primer.pdf}
+    \caption{Intuitive comparison of the two representation mechanisms used in this section. (a) Each graph node stores a traffic-entity feature vector. Directed edges carry messages from neighbouring nodes to the ego node, where an order-independent aggregation and update produce the next node representation. (b) Learned projections form queries, keys, and values from token embeddings. Scaled query--key similarities are normalised by a softmax, and the resulting attention weights combine the values into a contextualised token.
+    \label{fig:chapter_gnn_transformer_primer}}
+\end{figure}
+
+\subsection{The Presented Method}
+\label{subsec:magnet_method}
+
+This method converts dynamic agents and map elements into vectorised polylines and organises them as an attributed graph. Three branches encode temporal context, graph-based interactions, and ego-motion history before a decoder predicts the future ego trajectory. Keeping these information sources separate clarifies their roles and supports controlled topology comparisons. This method treats graph connectivity as a modelling assumption rather than a fixed preprocessing choice because local traffic may dominate lane-following scenes, whereas intersections often require broader context.
+
+The processing pipeline has four stages. First, polyline segments describe the geometry and motion of agents and map elements. Second, these segments form typed graph nodes connected by the selected adjacency rule. Third, the Transformer, GNN, and ego-motion branches encode complementary information. Finally, their embeddings are fused and decoded into a fixed-horizon trajectory. This modular structure permits topology ablations without changing the temporal encoder or trajectory decoder.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/overview.pdf}
+    \caption{Overview of the presented method. The Transformer module captures temporal motion dependencies, the GNN module models spatial interactions among agents and lanes, and the ego-motion module summarises ego dynamics. The fused representation is decoded into the future ego trajectory.
+    \label{fig:chapter_magnet_overview}}
+\end{figure}
+
+\subsubsection{Scene-to-Graph Representation}
+\label{subsubsec:magnet_scene_representation}
+
+Let
+\begin{equation}
+    \mathcal{A} = \{a_0, a_1,\ldots,a_N\}
+\end{equation}
+denote the set of dynamic agents in a scene, where \(a_0\) is the ego vehicle. Each dynamic agent is represented as a time-ordered polyline:
+\begin{equation}
+    P_i =
+    \{(x_t,y_t,\theta_t,v_t,\ldots)\}_{t=1}^{T_h},
+    \qquad i\in\{0,\ldots,N\},
+    \label{eq:chapter_agent_polyline}
+\end{equation}
+where \(x_t\) and \(y_t\) denote position, \(\theta_t\) denotes heading, and \(v_t\) denotes speed. Static map elements, such as lanes and crossings, are also represented as polylines, but they contain geometric information rather than temporal motion.
+
+The scene is then represented as an attributed graph:
+\begin{equation}
+    \mathcal{G}=(\mathcal{V},\mathcal{E}),
+    \label{eq:chapter_scene_graph}
+\end{equation}
+where nodes \(\mathcal{V}\) represent the ego vehicle, surrounding agents, and map elements, while edges \(\mathcal{E}\) encode spatial or semantic relations. This abstraction makes the model's interaction assumptions explicit. It also allows the graph topology to be changed without replacing the full network architecture.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/graph_node_types.pdf}
+    \caption{Scene-to-graph abstraction in the presented method. Dynamic agents and static map elements are represented as typed nodes, while directed edges encode spatial or semantic relations for graph-based interaction modelling.
+    \label{fig:chapter_graph_node_types}}
+\end{figure}
+
+Each polyline segment uses a shared 12-dimensional layout containing geometry, heading, temporal, velocity, and grouping fields:
+\begin{equation}
+\mathbf{f}^{\mathrm{agent}} =
+\left[
+\begin{array}{cccc}
+x_{\mathrm{start}} & y_{\mathrm{start}} & x_{\mathrm{end}} & y_{\mathrm{end}} \\
+\theta_{\mathrm{start}} & \theta_{\mathrm{end}} & \tau & v_{\mathrm{start}} \\
+v_{\mathrm{end}} & g & t_{\mathrm{start}} & t_{\mathrm{end}}
+\end{array}
+\right].
+\label{eq:chapter_agent_feature}
+\end{equation}
+Lane segments use the same layout, with temporal and velocity fields set to zero. The first nine dimensions provide learnable geometric, kinematic, and temporal inputs; the remaining fields support grouping and graph construction.
+
+Using one layout for agents and lanes allows both element types to enter the same batching and embedding pipeline. Type and grouping fields retain their identities, while zero-valued motion fields prevent static map elements from being interpreted as moving agents. The graph therefore preserves heterogeneous scene structure without requiring a separate data format for every node type.
+
+\subsubsection{Configurable Interaction Topologies}
+\label{subsubsec:magnet_topologies}
+
+The graph edge set \(\mathcal{E}\) is constructed through configurable adjacency rules. Four representative configurations are evaluated:
+\begin{itemize}
+    \item \textit{Default}: valid scene entities are connected according to the default interaction rule.
+    \item \textit{Ego Only}: only ego-linked relations are retained, while non-ego cross-agent edges are disabled.
+    \item \textit{Nearby Only}: only nearby entities within a distance threshold are connected.
+    \item \textit{No Ego Road}: ego-to-lane edges are removed while other valid relations are preserved.
+\end{itemize}
+The configurations test whether planning benefits from local, ego-centred, or broader contextual interactions.
+
+Nearby-only connectivity suppresses distant relations and emphasises the local neighbourhood. Ego-only connectivity retains direct relations involving the controlled vehicle but removes message passing among non-ego entities. No-ego-road connectivity tests how strongly the model depends on direct lane information, while the default graph retains the broadest context. Because all other modules remain unchanged, performance differences can be attributed more directly to these interaction assumptions.
+
+\subsubsection{Network Modules}
+\label{subsubsec:magnet_network_modules}
+
+The presented method uses three encoders. The context Transformer processes polyline-segment tokens and produces a temporal-contextual scene embedding \(\mathbf{h}_T\). The GNN applies message passing on the attributed graph and produces a spatial-interaction embedding \(\mathbf{h}_G\). A second Transformer processes the past ego positions and produces an ego-specific embedding \(\mathbf{h}_E\). The two Transformer branches have the same attention principle but do not share their encoder parameters.
+
+The branches deliberately receive overlapping but differently structured views of the scene. The Transformer can attend across segment tokens without relying on a prescribed neighbourhood, whereas the GNN restricts information flow through explicit edges. The ego branch ensures that the controlled vehicle's recent motion remains available even after scene-level pooling.
+
+For the context Transformer, each learnable segment vector \(\mathbf{x}_i\in\mathbb{R}^{9}\) is normalised and projected into a 128-dimensional embedding space:
+\begin{equation}
+    \mathbf{H}^{(0)} =
+    \mathbf{X}_T\mathbf{W}_{\mathrm{in}}+\mathbf{b}_{\mathrm{in}},
+    \label{eq:chapter_transformer_projection}
+\end{equation}
+where \(\mathbf{X}_T\in\mathbb{R}^{M\times 9}\) is the stacked token matrix and \(M\) is the number of polyline segments. A learned binary type embedding distinguishes agent segments from the remaining scene elements. The sum of the projected features and type embedding is normalised before entering a three-layer Transformer encoder. Each layer uses eight attention heads, a 128-dimensional model representation, and a 256-dimensional feed-forward sub-layer. Mean pooling over the encoded segment tokens produces \(\mathbf{h}_T\). Thus, the branch converts a variable number of scene segments into one fixed-dimensional contextual descriptor.
+
+For the GNN branch, node features are stacked into \(\mathbf{X}_G\in\mathbb{R}^{|\mathcal{V}|\times 9}\). Graph convolution propagates information through the configured adjacency matrix. With adjacency matrix \(\mathbf{A}\), self-loop adjacency \(\tilde{\mathbf{A}}=\mathbf{A}+\mathbf{I}\), and degree matrix \(\tilde{\mathbf{D}}\), one graph-convolution step can be written as
+\begin{equation}
+\mathbf{H}^{(1)}
+=
+\operatorname{ReLU}
+\left(
+\tilde{\mathbf{D}}^{-\frac{1}{2}}
+\tilde{\mathbf{A}}
+\tilde{\mathbf{D}}^{-\frac{1}{2}}
+\mathbf{X}_G
+\mathbf{W}^{(0)}
+\right).
+\label{eq:chapter_gnn_layer}
+\end{equation}
+The self-loop in \(\tilde{\mathbf{A}}\) retains the current node's own features during aggregation. Degree normalisation prevents nodes with many neighbours from producing systematically larger aggregated values than sparsely connected nodes. Although the general message-passing formulation in Eq.~\ref{eq:chapter_gnn_message} permits multidimensional edge features, the implemented GCN receives node features and graph connectivity; the topology determines which node representations are exchanged.
+
+The implemented GNN contains two graph-convolution layers. The first maps the nine input features to 64 channels, and the second maps 64 channels to 128 channels. Rectified linear activations introduce non-linearity, dropout with probability 0.1 regularises the node representations, and graph-level mean pooling produces \(\mathbf{h}_G\). Changing the topology therefore changes the interaction pathways without altering the encoder dimensions, pooling rule, or downstream decoder.
+
+The ego-motion branch receives the recent ego positions as a sequence in \(\mathbb{R}^{T_h\times 2}\). A two-layer feature encoder maps each two-dimensional position through 64 channels to the same 128-dimensional space used by the other branches. A two-layer, eight-head Transformer then models pairwise dependencies among the ego-history samples, and mean pooling produces \(\mathbf{h}_E\). This dedicated path prevents the ego's recent motion pattern from being diluted when the larger set of scene tokens is pooled.
+
+The three branch outputs are fused by concatenation:
+\begin{equation}
+    \mathbf{z}_0 =
+    [\mathbf{h}_T;\mathbf{h}_G;\mathbf{h}_E].
+    \label{eq:chapter_fusion_concat}
+\end{equation}
+Each branch output has 128 dimensions. Concatenation therefore forms a 384-dimensional vector, which is projected back to 128 dimensions. A multilayer perceptron maps this shared representation to \(2T_f\) values, and reshaping gives the sequence of future two-dimensional positions \(\hat{\mathbf{Y}}\).
+
+This late-fusion design avoids forcing temporal, relational, and ego-specific signals into a single intermediate representation. It also makes the architecture easier to analyse: topology changes affect the GNN pathway directly, while the Transformer and ego pathways provide consistent reference information across configurations.
+
+\subsubsection{Training Objective}
+\label{subsubsec:magnet_training_objective}
+
+The presented method is trained with supervised trajectory losses. The objective combines average displacement error, final displacement error, smoothness regularisation, and directional consistency:
+\begin{equation}
+\mathcal{L}
+=
+\lambda_{\mathrm{ADE}}\mathcal{L}_{\mathrm{ADE}}
++
+\lambda_{\mathrm{FDE}}\mathcal{L}_{\mathrm{FDE}}
++
+\lambda_{\mathrm{smooth}}\mathcal{L}_{\mathrm{smooth}}
++
+\lambda_{\mathrm{dir}}\mathcal{L}_{\mathrm{dir}}.
+\label{eq:chapter_total_loss}
+\end{equation}
+The ADE term measures the mean trajectory deviation over the prediction horizon:
+\begin{equation}
+\mathcal{L}_{\mathrm{ADE}}
+=
+\frac{1}{T_f}
+\sum_{t=1}^{T_f}
+\left\|
+\hat{\mathbf{y}}_t-\mathbf{y}_t
+\right\|_2,
+\label{eq:chapter_ade_loss}
+\end{equation}
+while the FDE term measures the final-step error:
+\begin{equation}
+\mathcal{L}_{\mathrm{FDE}}
+=
+\left\|
+\hat{\mathbf{y}}_{T_f}-\mathbf{y}_{T_f}
+\right\|_2.
+\label{eq:chapter_fde_loss}
+\end{equation}
+The smoothness and directional terms penalise abrupt motion and inconsistent heading changes.
+
+\subsection{Implementation and Reproducibility Notes}
+\label{subsec:magnet_implementation}
+
+The experiments use the \textit{nuPlan} dataset and the official Pittsburgh split. Each sample contains 2 s of historical context and a 6 s future trajectory. The local scene contains vectorised dynamic agents, lane segments, route lanes, and cross-walks within a radius of 30 m around the ego vehicle. The model is implemented in Python using PyTorch and PyTorch Geometric. 
+% The public implementation is provided at \url{https://github.com/XiaoYiGlasgow/MAGNET}.
+
+Processed \textit{nuPlan} scenes are loaded as graph batches, the presented method predicts the ego trajectory, and supervised losses update the model by back-propagation. All learning-based baselines use the same preprocessing pipeline, prediction horizon, and trajectory decoder where applicable, isolating the effects of recurrent, Transformer, graph, and modular encoding. The open-loop evaluation reports ADE over the full horizon and FDE at the final step; these metrics measure similarity to recorded trajectories rather than closed-loop safety.
+
+These settings keep the input representation consistent across the topology study. ADE measures average deviation throughout the horizon, whereas FDE isolates the endpoint error; reporting both distinguishes overall path alignment from final-position accuracy.
+
+\subsection{Experimental Results}
+\label{subsec:magnet_results}
+
+\subsubsection{Baseline Comparison}
+\label{subsubsec:magnet_baseline_results}
+
+The presented method is compared with IDM, LSTM, Transformer-only, and VectorNet-style baselines, covering rule-based, recurrent, attention-based, and graph-based planning.
+
+\begin{table}
+\caption{Quantitative comparison of the presented method and baseline models on the evaluated \textit{nuPlan} validation subset. Lower values are better.\label{tab:chapter_quantitative_results}}{%
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Model} & \textbf{ADE (m)} & \textbf{FDE (m)} \\
+\midrule
+IDM baseline      & 9.13 & 18.04 \\
+LSTM              & 2.21 & 6.50 \\
+Transformer-only  & 2.23 & 4.52 \\
+VectorNet         & 2.19 & \textbf{4.25} \\
+\textbf{The presented method}   & \textbf{2.09} & 4.47 \\
+\botrule
+\end{tabular}}{}
+\end{table}
+
+Table~\ref{tab:chapter_quantitative_results} shows that the presented method achieves the lowest ADE, reducing the Transformer-only result from 2.23 m to 2.09 m, while VectorNet records the lowest FDE. The presented method therefore improves full-horizon alignment while remaining competitive at the final step.
+
+The two metrics support a balanced interpretation. The ADE result favours the presented method's representation of the complete trajectory, but the FDE result does not establish uniform dominance over graph-based baselines. The comparison therefore supports the modular design without implying that one architecture is best under every trajectory criterion.
+
+\subsubsection{Scenario-wise Topology Analysis}
+\label{subsubsec:magnet_topology_results}
+
+The most important empirical observation is that different driving scenarios prefer different interaction topologies. Table~\ref{tab:chapter_detailed_topology_results} reports all four configurations for each representative scenario category.
+
+\begin{table}
+\caption{Detailed performance across scenario categories and graph-connectivity configurations. The table reports the best ADE and FDE observed for each configuration.\label{tab:chapter_detailed_topology_results}}{%
+\begin{tabular}{@{}llcc@{}}
+\toprule
+\textbf{Scenario} & \textbf{Topology} & \textbf{ADE (m)} & \textbf{FDE (m)} \\
+\midrule
+High lateral acceleration & Default & 2.13 & 4.20 \\
+High lateral acceleration & Ego Only & 2.06 & 3.87 \\
+High lateral acceleration & Nearby Only & \textbf{1.58} & \textbf{3.31} \\
+High lateral acceleration & No Ego Road & 2.34 & 4.57 \\
+\midrule
+High magnitude speed & Default & 3.09 & 6.89 \\
+High magnitude speed & Ego Only & 3.01 & 6.38 \\
+High magnitude speed & Nearby Only & \textbf{2.53} & \textbf{5.48} \\
+High magnitude speed & No Ego Road & 2.92 & 5.99 \\
+\midrule
+Medium magnitude speed & Default & 2.71 & 5.33 \\
+Medium magnitude speed & Ego Only & 2.68 & 5.31 \\
+Medium magnitude speed & Nearby Only & \textbf{1.34} & \textbf{3.51} \\
+Medium magnitude speed & No Ego Road & 1.73 & 4.09 \\
+\midrule
+Near multiple vehicles & Default & 1.51 & 2.77 \\
+Near multiple vehicles & Ego Only & \textbf{1.38} & \textbf{2.43} \\
+Near multiple vehicles & Nearby Only & 1.80 & 3.35 \\
+Near multiple vehicles & No Ego Road & 1.62 & 2.94 \\
+\midrule
+Traversing intersection & Default & \textbf{2.45} & \textbf{5.47} \\
+Traversing intersection & Ego Only & 2.50 & 5.71 \\
+Traversing intersection & Nearby Only & 3.18 & 6.68 \\
+Traversing intersection & No Ego Road & 3.06 & 6.40 \\
+\botrule
+\end{tabular}}{}
+\end{table}
+
+Nearby-only connectivity performs best in the lateral-acceleration and speed categories, where local geometry and nearby traffic dominate the prediction. Ego-only connectivity performs best near multiple vehicles, suggesting that direct ego-neighbour relations are more useful than interactions among surrounding agents in this category. By contrast, default connectivity performs best at intersections, where lane geometry and multidirectional traffic require broader context.
+
+The lateral-acceleration result illustrates the value of a restricted neighbourhood. During turning or rapid lateral motion, nearby lanes and agents impose the most immediate constraints, and additional long-range edges may introduce weakly relevant messages. The same pattern appears in the high- and medium-speed categories, where nearby-only connectivity obtains the lowest ADE and FDE.
+
+Dense multi-vehicle scenes produce a different result. Ego-only connectivity preserves direct ego-neighbour relations while removing exchanges among surrounding agents that may not constrain the predicted ego trajectory. At intersections, however, the default graph performs best because local neighbours alone do not fully describe route geometry or multidirectional traffic flow. These contrasting cases explain why a single fixed topology can be unnecessarily restrictive.
+
+These results show that graph connectivity is a scenario-dependent modelling choice rather than a fixed implementation detail. Aggregate scores can conceal this dependence, so planners should also be evaluated in categories that stress local traffic, dense interactions, high-speed motion, and intersections. The presented method provides both a trajectory predictor and a controlled framework for studying these topology choices.
+
+The scenario-wise analysis also qualifies the aggregate baseline comparison. A model may obtain a strong average score while using a graph that is poorly matched to a particular interaction pattern. Reporting category-level results reveals this hidden dependence and provides a more informative basis for choosing or learning graph connectivity in future planners.
+
+\subsubsection{Qualitative Trajectory Behaviour}
+\label{subsubsec:magnet_qualitative_results}
+
+Fig.~\ref{fig:chapter_qualitative_traj} shows that predictions remain generally smooth and lane-consistent, while their shapes change across topology settings. The examples support the quantitative finding that graph connectivity affects both trajectory error and planning behaviour.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.7\textwidth]{figures/simulation_visualisation.pdf}
+    \caption{Qualitative motion planning results of the presented method across representative \textit{nuPlan} scenarios. Rows correspond to different driving scenarios, and columns correspond to different graph connectivity configurations. The examples illustrate how different interaction topologies influence trajectory generation behaviour under varying traffic contexts.
+    \label{fig:chapter_qualitative_traj}}
+\end{figure}
+
+\subsection{Practical Notes and Limitations}
+\label{subsec:magnet_practical_notes}
+
+The presented method shows that Transformer and GNN modules serve complementary roles: the Transformer encodes temporal context, the GNN makes interaction structure explicit, and the ego branch preserves the controlled vehicle's history. The topology results further indicate that interaction modelling should adapt to the traffic context rather than assume one universal graph.
+
+Three practical conclusions follow. Temporal encoding alone does not specify which agents or map elements should exchange information. Graph reasoning supplies this structure, but its connectivity must match the scenario. Separating these roles before fusion makes the influence of temporal context, spatial interaction, and ego history easier to interpret.
+
+The study remains limited to open-loop evaluation, so low ADE and FDE do not guarantee closed-loop safety, comfort, or rule compliance. MAGNET also predicts one deterministic future despite the multiple plausible outcomes of real traffic. Future work should evaluate closed-loop behaviour and investigate multimodal prediction and adaptive graph construction.
+
+% \subsection*{References}
+% This reference block follows the MAGNET manuscript style and can be merged
+% into the unified book-chapter bibliography during final integration.

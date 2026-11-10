@@ -1,0 +1,11 @@
+# Reference environment (Linux, Python 3.9.21). Install torch first, matching your hardware, e.g.
+#   pip install torch==2.0.1 --index-url https://download.pytorch.org/whl/cpu      (CPU)
+#   pip install torch==2.0.1 --index-url https://download.pytorch.org/whl/cu118    (CUDA 11.8)
+# then: pip install -r requirements.txt
+torch==2.0.1
+torch_geometric==2.6.1
+numpy==1.23.4
+pandas==2.2.3           # imported by code/utils/dataset.py
+scikit-learn==1.6.1     # imported by code/train.py
+tqdm==4.67.1
+matplotlib==3.8.0       # figures of demo.sh
